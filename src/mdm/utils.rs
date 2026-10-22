@@ -838,10 +838,31 @@ fn sync_toml_item(item: &mut toml_edit::Item, desired: &toml::Value) {
         (toml_edit::Item::ArrayOfTables(array), toml::Value::Array(desired))
             if is_array_of_tables(desired) =>
         {
+            // Drop the tables `desired` no longer has, rather than the last ones,
+            // so a table that stays keeps its own comments instead of taking
+            // over the slot (and decor) of the one before it.
+            let desired_tables: Vec<&toml::Table> =
+                desired.iter().filter_map(toml::Value::as_table).collect();
+            let mut next = 0;
+            let mut kept = vec![false; array.len()];
+            for (idx, table) in array.iter().enumerate() {
+                if next < desired_tables.len() && toml_table_eq(table, desired_tables[next]) {
+                    kept[idx] = true;
+                    next += 1;
+                }
+            }
+            for idx in (0..array.len()).rev() {
+                if array.len() <= desired.len() {
+                    break;
+                }
+                if !kept[idx] {
+                    array.remove(idx);
+                }
+            }
             while array.len() > desired.len() {
                 array.remove(array.len() - 1);
             }
-            for (idx, desired) in desired.iter().filter_map(toml::Value::as_table).enumerate() {
+            for (idx, desired) in desired_tables.into_iter().enumerate() {
                 match array.get_mut(idx) {
                     Some(table) => sync_toml_table(table, desired),
                     None => array.push(new_toml_table(desired)),
@@ -894,6 +915,54 @@ fn toml_scalar_eq(existing: &toml_edit::Value, desired: &toml::Value) -> bool {
         (toml_edit::Value::Boolean(a), toml::Value::Boolean(b)) => a.value() == b,
         (toml_edit::Value::Datetime(a), toml::Value::Datetime(b)) => a.value() == b,
         _ => false,
+    }
+}
+
+fn toml_table_eq(table: &toml_edit::Table, desired: &toml::Table) -> bool {
+    table.len() == desired.len()
+        && desired.iter().all(|(key, desired)| {
+            table
+                .get(key)
+                .is_some_and(|item| toml_item_eq(item, desired))
+        })
+}
+
+fn toml_item_eq(item: &toml_edit::Item, desired: &toml::Value) -> bool {
+    match (item, desired) {
+        (toml_edit::Item::Value(value), desired) => toml_value_eq(value, desired),
+        (toml_edit::Item::Table(table), toml::Value::Table(desired)) => {
+            toml_table_eq(table, desired)
+        }
+        (toml_edit::Item::ArrayOfTables(array), toml::Value::Array(desired)) => {
+            array.len() == desired.len()
+                && array.iter().zip(desired).all(|(table, desired)| {
+                    desired
+                        .as_table()
+                        .is_some_and(|desired| toml_table_eq(table, desired))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn toml_value_eq(value: &toml_edit::Value, desired: &toml::Value) -> bool {
+    match (value, desired) {
+        (toml_edit::Value::InlineTable(table), toml::Value::Table(desired)) => {
+            table.len() == desired.len()
+                && desired.iter().all(|(key, desired)| {
+                    table
+                        .get(key)
+                        .is_some_and(|value| toml_value_eq(value, desired))
+                })
+        }
+        (toml_edit::Value::Array(array), toml::Value::Array(desired)) => {
+            array.len() == desired.len()
+                && array
+                    .iter()
+                    .zip(desired)
+                    .all(|(value, desired)| toml_value_eq(value, desired))
+        }
+        (value, desired) => toml_scalar_eq(value, desired),
     }
 }
 
@@ -1746,6 +1815,33 @@ command = "notify-send done"
             update_toml_preserving_format(&updated, &original_value).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn test_update_toml_preserving_format_removes_the_dropped_table_of_an_array() {
+        let original = r#"[[hooks.Stop]]
+command = "git-ai checkpoint codex"
+
+# my own hook
+[[hooks.Stop]]
+command = "notify-send done" # keep this note
+"#;
+        let mut desired: toml::Value = toml::from_str(original).unwrap();
+        desired
+            .get_mut("hooks")
+            .and_then(|v| v.get_mut("Stop"))
+            .and_then(|v| v.as_array_mut())
+            .unwrap()
+            .remove(0);
+
+        let updated = update_toml_preserving_format(original, &desired).unwrap();
+
+        assert!(
+            updated.contains("# my own hook") && updated.contains("# keep this note"),
+            "comments of the remaining hook should be kept, got:\n{updated}"
+        );
+        assert!(!updated.contains("git-ai"), "got:\n{updated}");
+        assert_eq!(toml::from_str::<toml::Value>(&updated).unwrap(), desired);
     }
 
     #[test]
